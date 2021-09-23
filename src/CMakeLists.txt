@@ -15,6 +15,7 @@ option(USE_STATIC_MOLTENVK "link moltenvk static library" OFF)
 find_package(Threads)
 find_package(OpenMP)
 find_package(Vulkan REQUIRED)
+find_package(OpenCV REQUIRED)
 
 macro(waifu2x_add_shader SHADER_SRC)
     get_filename_component(SHADER_SRC_NAME_WE ${SHADER_SRC} NAME_WE)
@@ -235,7 +236,9 @@ add_executable(waifu2x-ncnn-vulkan main.cpp waifu2x.cpp)
 
 add_dependencies(waifu2x-ncnn-vulkan generate-spirv)
 
-set(WAIFU2X_LINK_LIBRARIES ncnn webp ${Vulkan_LIBRARY})
+include_directories( ${OpenCV_INCLUDE_DIRS} )
+
+set(WAIFU2X_LINK_LIBRARIES ncnn webp ${Vulkan_LIBRARY} ${OpenCV_LIBS})
 
 if(USE_STATIC_MOLTENVK)
     find_library(CoreFoundation NAMES CoreFoundation)

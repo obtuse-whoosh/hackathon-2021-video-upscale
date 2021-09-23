@@ -5,11 +5,11 @@
 #include <queue>
 #include <vector>
 #include <clocale>
+#include <map>
 
-#if _WIN32
-// image decoder and encoder with wic
-#include "wic_image.h"
-#else // _WIN32
+#include <opencv2/core.hpp>
+#include <opencv2/highgui.hpp>
+
 // image decoder and encoder with stb
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_NO_PSD
@@ -21,55 +21,7 @@
 #include "stb_image.h"
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
-#endif // _WIN32
 #include "webp_image.h"
-
-#if _WIN32
-#include <wchar.h>
-static wchar_t* optarg = NULL;
-static int optind = 1;
-static wchar_t getopt(int argc, wchar_t* const argv[], const wchar_t* optstring)
-{
-    if (optind >= argc || argv[optind][0] != L'-')
-        return -1;
-
-    wchar_t opt = argv[optind][1];
-    const wchar_t* p = wcschr(optstring, opt);
-    if (p == NULL)
-        return L'?';
-
-    optarg = NULL;
-
-    if (p[1] == L':')
-    {
-        optind++;
-        if (optind >= argc)
-            return L'?';
-
-        optarg = argv[optind];
-    }
-
-    optind++;
-
-    return opt;
-}
-
-static std::vector<int> parse_optarg_int_array(const wchar_t* optarg)
-{
-    std::vector<int> array;
-    array.push_back(_wtoi(optarg));
-
-    const wchar_t* p = wcschr(optarg, L',');
-    while (p)
-    {
-        p++;
-        array.push_back(_wtoi(p));
-        p = wcschr(p, L',');
-    }
-
-    return array;
-}
-#else // _WIN32
 #include <unistd.h> // getopt()
 
 static std::vector<int> parse_optarg_int_array(const char* optarg)
@@ -87,7 +39,6 @@ static std::vector<int> parse_optarg_int_array(const char* optarg)
 
     return array;
 }
-#endif // _WIN32
 
 // ncnn
 #include "cpu.h"
@@ -103,8 +54,8 @@ static void print_usage()
     fprintf(stdout, "Usage: waifu2x-ncnn-vulkan -i infile -o outfile [options]...\n\n");
     fprintf(stdout, "  -h                   show this help\n");
     fprintf(stdout, "  -v                   verbose output\n");
-    fprintf(stdout, "  -i input-path        input image path (jpg/png/webp) or directory\n");
-    fprintf(stdout, "  -o output-path       output image path (jpg/png/webp) or directory\n");
+    fprintf(stdout, "  -i input-path        input video path\n");
+    fprintf(stdout, "  -o output-path       output video path\n");
     fprintf(stdout, "  -n noise-level       denoise level (-1/0/1/2/3, default=0)\n");
     fprintf(stdout, "  -s scale             upscale ratio (1/2/4/8/16/32, default=2)\n");
     fprintf(stdout, "  -t tile-size         tile size (>=32/0=auto, default=0) can be 0,0,0 for multi-gpu\n");
@@ -112,18 +63,17 @@ static void print_usage()
     fprintf(stdout, "  -g gpu-id            gpu device to use (-1=cpu, default=auto) can be 0,1,2 for multi-gpu\n");
     fprintf(stdout, "  -j load:proc:save    thread count for load/proc/save (default=1:2:2) can be 1:2,2,2:2 for multi-gpu\n");
     fprintf(stdout, "  -x                   enable tta mode\n");
-    fprintf(stdout, "  -f format            output image format (jpg/png/webp, default=ext/png)\n");
+    fprintf(stdout, "  -f                   FPS multiplier i.e frame interpolation (1=no interpolation, default=1)\n");
+    // fprintf(stdout, "  -f format            output image format (jpg/png/webp, default=ext/png)\n");
 }
 
 class Task
 {
 public:
     int id;
-    int webp;
     int scale;
-
-    path_t inpath;
-    path_t outpath;
+    int frame;
+    int duplicate_of;
 
     ncnn::Mat inimage;
     ncnn::Mat outimage;
@@ -183,123 +133,64 @@ class LoadThreadParams
 public:
     int scale;
     int jobs_load;
-
-    // session data
-    std::vector<path_t> input_files;
-    std::vector<path_t> output_files;
+    cv::VideoCapture input_video;
+    cv::VideoWriter output_video;
 };
 
+// Loads all video frames and queues up processing tasks
 void* load(void* args)
 {
     const LoadThreadParams* ltp = (const LoadThreadParams*)args;
-    const int count = ltp->input_files.size();
     const int scale = ltp->scale;
-
+    cv::VideoCapture reader = ltp->input_video;
+    
+    std::map<size_t, int>  frame_hashes;
+    int frame_count = reader.get(cv::CAP_PROP_FRAME_COUNT);
+    cv::Mat frame;
     #pragma omp parallel for schedule(static,1) num_threads(ltp->jobs_load)
-    for (int i=0; i<count; i++)
+    for (int i = 0; i < frame_count; i++)
     {
-        const path_t& imagepath = ltp->input_files[i];
-
-        int webp = 0;
-
-        unsigned char* pixeldata = 0;
-        int w;
-        int h;
-        int c;
-
-#if _WIN32
-        FILE* fp = _wfopen(imagepath.c_str(), L"rb");
-#else
-        FILE* fp = fopen(imagepath.c_str(), "rb");
-#endif
-        if (fp)
+        // Read video frame
+        if (!reader.read(frame))
         {
-            // read whole file
-            unsigned char* filedata = 0;
-            int length = 0;
-            {
-                fseek(fp, 0, SEEK_END);
-                length = ftell(fp);
-                rewind(fp);
-                filedata = (unsigned char*)malloc(length);
-                if (filedata)
-                {
-                    fread(filedata, 1, length, fp);
-                }
-                fclose(fp);
-            }
+            continue;
+        }
 
-            if (filedata)
-            {
-                pixeldata = webp_load(filedata, length, &w, &h, &c);
-                if (pixeldata)
-                {
-                    webp = 1;
-                }
-                else
-                {
-                    // not webp, try jpg png etc.
-#if _WIN32
-                    pixeldata = wic_decode_image(imagepath.c_str(), &w, &h, &c);
-#else // _WIN32
-                    pixeldata = stbi_load_from_memory(filedata, length, &w, &h, &c, 0);
-                    if (pixeldata)
-                    {
-                        // stb_image auto channel
-                        if (c == 1)
-                        {
-                            // grayscale -> rgb
-                            stbi_image_free(pixeldata);
-                            pixeldata = stbi_load_from_memory(filedata, length, &w, &h, &c, 3);
-                            c = 3;
-                        }
-                        else if (c == 2)
-                        {
-                            // grayscale + alpha -> rgba
-                            stbi_image_free(pixeldata);
-                            pixeldata = stbi_load_from_memory(filedata, length, &w, &h, &c, 4);
-                            c = 4;
-                        }
-                    }
-#endif // _WIN32
-                }
+        // Define frame process task
+        Task v;
+        v.id = i;
+        v.scale = scale;
+        v.frame = i;
 
-                free(filedata);
+        // BGR => RGB
+        int w = frame.cols;
+        int h = frame.rows;
+        int c = frame.channels();
+        uint8_t* pixelPtr = (uint8_t*)frame.data;
+        uint8_t* pixeldata = (uint8_t*)malloc(w * h * c);
+        for(int i = 0; i < h; i++)
+        {
+            for(int j = 0; j < w; j++)
+            {
+                pixeldata[i*w*c + j*c + 2] /* R */ = pixelPtr[i*w*c + j*c + 0]; // B
+                pixeldata[i*w*c + j*c + 1] /* G */ = pixelPtr[i*w*c + j*c + 1]; // G
+                pixeldata[i*w*c + j*c + 0] /* B */ = pixelPtr[i*w*c + j*c + 2]; // R
             }
         }
-        if (pixeldata)
-        {
-            Task v;
-            v.id = i;
-            v.webp = webp;
-            v.scale = scale;
-            v.inpath = imagepath;
-            v.outpath = ltp->output_files[i];
 
-            v.inimage = ncnn::Mat(w, h, (void*)pixeldata, (size_t)c, c);
+        size_t key = std::_Hash_bytes(pixeldata, w * h * c, 0xdeadbeef);
+        // TODO
+        // if (frame_hashes.count(key))
+        // {
+        //     v.duplicate_of = frame_hashes[key];
+        // } else 
+        // {
+        //     frame_hashes[key] = i;
+            v.duplicate_of = -1;
+        // }
 
-            path_t ext = get_file_extension(v.outpath);
-            if (c == 4 && (ext == PATHSTR("jpg") || ext == PATHSTR("JPG") || ext == PATHSTR("jpeg") || ext == PATHSTR("JPEG")))
-            {
-                path_t output_filename2 = ltp->output_files[i] + PATHSTR(".png");
-                v.outpath = output_filename2;
-#if _WIN32
-                fwprintf(stderr, L"image %ls has alpha channel ! %ls will output %ls\n", imagepath.c_str(), imagepath.c_str(), output_filename2.c_str());
-#else // _WIN32
-                fprintf(stderr, "image %s has alpha channel ! %s will output %s\n", imagepath.c_str(), imagepath.c_str(), output_filename2.c_str());
-#endif // _WIN32
-            }
-
-            toproc.put(v);
-        }
-        else
-        {
-#if _WIN32
-            fwprintf(stderr, L"decode image %ls failed\n", imagepath.c_str());
-#else // _WIN32
-            fprintf(stderr, "decode image %s failed\n", imagepath.c_str());
-#endif // _WIN32
-        }
+        v.inimage = ncnn::Mat(w, h, (void*)pixeldata, (size_t)c, c);
+        toproc.put(v);
     }
 
     return 0;
@@ -311,6 +202,7 @@ public:
     const Waifu2x* waifu2x;
 };
 
+// Proccesses video frames
 void* proc(void* args)
 {
     const ProcThreadParams* ptp = (const ProcThreadParams*)args;
@@ -324,6 +216,12 @@ void* proc(void* args)
 
         if (v.id == -233)
             break;
+
+        if (v.duplicate_of >= 0)
+        {
+            tosave.put(v);
+            continue;
+        }
 
         const int scale = v.scale;
         if (scale == 1)
@@ -377,13 +275,69 @@ class SaveThreadParams
 {
 public:
     int verbose;
+    int fps_mult;
+    cv::VideoWriter output_video;
+    std::string output_file;
 };
+
+class Frame
+{
+public:
+    int num;
+    int duplicate_of;
+    cv::Mat frame;
+};
+
+bool compareFrame(Frame i1, Frame i2)
+{
+    return (i1.num < i2.num);
+}
+
+cv::Mat write(std::string output_file, cv::VideoWriter output_video, Frame frame, cv::Mat prev_frame, int fps_mult) {
+  
+  cv::Mat current_frame;
+  if (frame.duplicate_of >= 0) 
+  {
+    cv::VideoCapture input_output_video(output_file);
+    if (!input_output_video.isOpened())
+    {
+        fprintf(stderr, "\nFailed to open input_output_video%s\n", output_file.c_str());
+    }
+    
+    input_output_video.set(cv::CAP_PROP_POS_FRAMES, frame.duplicate_of * fps_mult);
+    input_output_video.read(current_frame);
+    input_output_video.release();
+  } else {
+    current_frame = frame.frame;
+  }
+
+    if (frame.num == 233) { cv::imwrite("/home/jrobb/Downloads/lee_pre.png", prev_frame); } // TODO: remove
+    for (int i = 1; frame.num > 0 && i < fps_mult; i++)
+    {
+        cv::Mat mid_frame;
+        cv::addWeighted(prev_frame, 1 - (i / (double)fps_mult), current_frame , i / (double)fps_mult, 0, mid_frame);
+        output_video.write(mid_frame);
+        if (frame.num == 233) { cv::imwrite("/home/jrobb/Downloads/lee_"+std::to_string(i)+".png", mid_frame); } // TODO: remove
+    }
+
+    output_video.write(current_frame);
+    if (frame.num == 233) { cv::imwrite("/home/jrobb/Downloads/lee_post.png", current_frame); } // TODO: remove
+    return current_frame;
+}
 
 void* save(void* args)
 {
     const SaveThreadParams* stp = (const SaveThreadParams*)args;
     const int verbose = stp->verbose;
+    int fps_mult = stp->fps_mult;
+    int dups = 0;
+    int current_frame = 0;
+    cv::Mat prev_frame;
+    cv::VideoWriter output_video = stp->output_video;
+    std::string output_file = stp->output_file;
+    std::map<int, Frame> frames;
 
+    fprintf(stdout, "Processing frame 0, duplicates 0\n");
     for (;;)
     {
         Task v;
@@ -394,81 +348,65 @@ void* save(void* args)
             break;
 
         // free input pixel data
+        uint8_t * oldPixeldata = (uint8_t *)v.inimage.data;
+        free(oldPixeldata);
+
+        // RGB => BGR
+        cv::Mat a = cv::Mat(v.outimage.h, v.outimage.w, CV_8UC3);
+        unsigned char* pixelPtr = (unsigned char*)v.outimage.data;
+        unsigned char* pixeldata = (unsigned char *)a.data;
+        for(int i = 0; i < v.outimage.h; i++)
         {
-            unsigned char* pixeldata = (unsigned char*)v.inimage.data;
-            if (v.webp == 1)
+            for(int j = 0; j < v.outimage.w; j++)
             {
-                free(pixeldata);
-            }
-            else
-            {
-#if _WIN32
-                free(pixeldata);
-#else
-                stbi_image_free(pixeldata);
-#endif
+                int offset = i*v.outimage.w*3 + j*3;
+                pixeldata[offset + 2] /* R */ = pixelPtr[offset]; // B
+                pixeldata[offset+ 1] /* G */ = pixelPtr[offset + 1]; // G
+                pixeldata[offset] /* B */ = pixelPtr[offset + 2]; // R
             }
         }
 
-        int success = 0;
+        // add  frame
+        Frame frame;
+        frame.num = v.frame;
+        frame.duplicate_of = v.duplicate_of;
+        frame.frame = a;
 
-        path_t ext = get_file_extension(v.outpath);
+        if (frame.duplicate_of >= 0)
+        { 
+            dups++; 
+        }
 
-        if (ext == PATHSTR("webp") || ext == PATHSTR("WEBP"))
-        {
-            success = webp_save(v.outpath.c_str(), v.outimage.w, v.outimage.h, v.outimage.elempack, (const unsigned char*)v.outimage.data);
+        // process current frame
+        if (frame.num == current_frame) {
+            // if in order, write!
+            current_frame++;
+            prev_frame = write(output_file, output_video, frame, prev_frame, fps_mult);
+            fprintf(stdout, "\033[A\33[2KT\rProcessing frame %d, duplicates %d, queued %lu\n", v.frame, dups, frames.size());
+        } else {
+            // queue it for precessing
+            frames[frame.num] = frame;
         }
-        else if (ext == PATHSTR("png") || ext == PATHSTR("PNG"))
-        {
-#if _WIN32
-            success = wic_encode_image(v.outpath.c_str(), v.outimage.w, v.outimage.h, v.outimage.elempack, v.outimage.data);
-#else
-            success = stbi_write_png(v.outpath.c_str(), v.outimage.w, v.outimage.h, v.outimage.elempack, v.outimage.data, 0);
-#endif
-        }
-        else if (ext == PATHSTR("jpg") || ext == PATHSTR("JPG") || ext == PATHSTR("jpeg") || ext == PATHSTR("JPEG"))
-        {
-#if _WIN32
-            success = wic_encode_jpeg_image(v.outpath.c_str(), v.outimage.w, v.outimage.h, v.outimage.elempack, v.outimage.data);
-#else
-            success = stbi_write_jpg(v.outpath.c_str(), v.outimage.w, v.outimage.h, v.outimage.elempack, v.outimage.data, 100);
-#endif
-        }
-        if (success)
-        {
-            if (verbose)
-            {
-#if _WIN32
-                fwprintf(stdout, L"%ls -> %ls done\n", v.inpath.c_str(), v.outpath.c_str());
-#else
-                fprintf(stdout, "%s -> %s done\n", v.inpath.c_str(), v.outpath.c_str());
-#endif
-            }
-        }
-        else
-        {
-#if _WIN32
-            fwprintf(stderr, L"encode image %ls failed\n", v.outpath.c_str());
-#else
-            fprintf(stderr, "encode image %s failed\n", v.outpath.c_str());
-#endif
+
+        // process queued up frames
+        while (frames.count(current_frame)) {
+            prev_frame = write(output_file, output_video, frame, prev_frame, fps_mult);
+            fprintf(stdout, "\033[A\33[2KT\rProcessing frame %d, duplicates %d, queued %lu\n", v.frame, dups, frames.size());
+            frames.erase(current_frame);
+            current_frame++;
         }
     }
 
     return 0;
 }
 
-
-#if _WIN32
-int wmain(int argc, wchar_t** argv)
-#else
 int main(int argc, char** argv)
-#endif
 {
     path_t inputpath;
     path_t outputpath;
     int noise = 0;
     int scale = 2;
+    int fps_multiplier = 1;
     std::vector<int> tilesize;
     path_t model = PATHSTR("models-cunet");
     std::vector<int> gpuid;
@@ -479,54 +417,6 @@ int main(int argc, char** argv)
     int tta_mode = 0;
     path_t format = PATHSTR("png");
 
-#if _WIN32
-    setlocale(LC_ALL, "");
-    wchar_t opt;
-    while ((opt = getopt(argc, argv, L"i:o:n:s:t:m:g:j:f:vxh")) != (wchar_t)-1)
-    {
-        switch (opt)
-        {
-        case L'i':
-            inputpath = optarg;
-            break;
-        case L'o':
-            outputpath = optarg;
-            break;
-        case L'n':
-            noise = _wtoi(optarg);
-            break;
-        case L's':
-            scale = _wtoi(optarg);
-            break;
-        case L't':
-            tilesize = parse_optarg_int_array(optarg);
-            break;
-        case L'm':
-            model = optarg;
-            break;
-        case L'g':
-            gpuid = parse_optarg_int_array(optarg);
-            break;
-        case L'j':
-            swscanf(optarg, L"%d:%*[^:]:%d", &jobs_load, &jobs_save);
-            jobs_proc = parse_optarg_int_array(wcschr(optarg, L':') + 1);
-            break;
-        case L'f':
-            format = optarg;
-            break;
-        case L'v':
-            verbose = 1;
-            break;
-        case L'x':
-            tta_mode = 1;
-            break;
-        case L'h':
-        default:
-            print_usage();
-            return -1;
-        }
-    }
-#else // _WIN32
     int opt;
     while ((opt = getopt(argc, argv, "i:o:n:s:t:m:g:j:f:vxh")) != -1)
     {
@@ -557,14 +447,17 @@ int main(int argc, char** argv)
             sscanf(optarg, "%d:%*[^:]:%d", &jobs_load, &jobs_save);
             jobs_proc = parse_optarg_int_array(strchr(optarg, ':') + 1);
             break;
-        case 'f':
-            format = optarg;
-            break;
+        // case 'f':
+        //     format = optarg;
+        //     break;
         case 'v':
             verbose = 1;
             break;
         case 'x':
             tta_mode = 1;
+            break;
+        case 'f':
+            fps_multiplier = atoi(optarg);
             break;
         case 'h':
         default:
@@ -572,7 +465,6 @@ int main(int argc, char** argv)
             return -1;
         }
     }
-#endif // _WIN32
 
     if (inputpath.empty() || outputpath.empty())
     {
@@ -628,94 +520,23 @@ int main(int argc, char** argv)
         }
     }
 
-    if (!path_is_directory(outputpath))
+    if (path_is_directory(inputpath) || path_is_directory(outputpath))
     {
-        // guess format from outputpath no matter what format argument specified
-        path_t ext = get_file_extension(outputpath);
-
-        if (ext == PATHSTR("png") || ext == PATHSTR("PNG"))
-        {
-            format = PATHSTR("png");
-        }
-        else if (ext == PATHSTR("webp") || ext == PATHSTR("WEBP"))
-        {
-            format = PATHSTR("webp");
-        }
-        else if (ext == PATHSTR("jpg") || ext == PATHSTR("JPG") || ext == PATHSTR("jpeg") || ext == PATHSTR("JPEG"))
-        {
-            format = PATHSTR("jpg");
-        }
-        else
-        {
-            fprintf(stderr, "invalid outputpath extension type\n");
-            return -1;
-        }
+        fprintf(stderr, "Only single input is currently supported\n");
+        return -1;
     }
 
-    if (format != PATHSTR("png") && format != PATHSTR("webp") && format != PATHSTR("jpg"))
+    if (path_is_directory(outputpath))
     {
-        fprintf(stderr, "invalid format argument\n");
+        fprintf(stderr, "Only single output is currently supported\n");
         return -1;
     }
 
     // collect input and output filepath
-    std::vector<path_t> input_files;
-    std::vector<path_t> output_files;
-    {
-        if (path_is_directory(inputpath) && path_is_directory(outputpath))
-        {
-            std::vector<path_t> filenames;
-            int lr = list_directory(inputpath, filenames);
-            if (lr != 0)
-                return -1;
-
-            const int count = filenames.size();
-            input_files.resize(count);
-            output_files.resize(count);
-
-            path_t last_filename;
-            path_t last_filename_noext;
-            for (int i=0; i<count; i++)
-            {
-                path_t filename = filenames[i];
-                path_t filename_noext = get_file_name_without_extension(filename);
-                path_t output_filename = filename_noext + PATHSTR('.') + format;
-
-                // filename list is sorted, check if output image path conflicts
-                if (filename_noext == last_filename_noext)
-                {
-                    path_t output_filename2 = filename + PATHSTR('.') + format;
-#if _WIN32
-                    fwprintf(stderr, L"both %ls and %ls output %ls ! %ls will output %ls\n", filename.c_str(), last_filename.c_str(), output_filename.c_str(), filename.c_str(), output_filename2.c_str());
-#else
-                    fprintf(stderr, "both %s and %s output %s ! %s will output %s\n", filename.c_str(), last_filename.c_str(), output_filename.c_str(), filename.c_str(), output_filename2.c_str());
-#endif
-                    output_filename = output_filename2;
-                }
-                else
-                {
-                    last_filename = filename;
-                    last_filename_noext = filename_noext;
-                }
-
-                input_files[i] = inputpath + PATHSTR('/') + filename;
-                output_files[i] = outputpath + PATHSTR('/') + output_filename;
-            }
-        }
-        else if (!path_is_directory(inputpath) && !path_is_directory(outputpath))
-        {
-            input_files.push_back(inputpath);
-            output_files.push_back(outputpath);
-        }
-        else
-        {
-            fprintf(stderr, "inputpath and outputpath must be either file or directory at the same time\n");
-            return -1;
-        }
-    }
-
+    path_t input_file = inputpath;
+    path_t output_file = outputpath;
+    
     int prepadding = 0;
-
     if (model.find(PATHSTR("models-cunet")) != path_t::npos)
     {
         if (noise == -1)
@@ -745,25 +566,6 @@ int main(int argc, char** argv)
         return -1;
     }
 
-#if _WIN32
-    wchar_t parampath[256];
-    wchar_t modelpath[256];
-    if (noise == -1)
-    {
-        swprintf(parampath, 256, L"%s/scale2.0x_model.param", model.c_str());
-        swprintf(modelpath, 256, L"%s/scale2.0x_model.bin", model.c_str());
-    }
-    else if (scale == 1)
-    {
-        swprintf(parampath, 256, L"%s/noise%d_model.param", model.c_str(), noise);
-        swprintf(modelpath, 256, L"%s/noise%d_model.bin", model.c_str(), noise);
-    }
-    else if (scale == 2 || scale == 4 || scale == 8 || scale == 16 || scale == 32)
-    {
-        swprintf(parampath, 256, L"%s/noise%d_scale2.0x_model.param", model.c_str(), noise);
-        swprintf(modelpath, 256, L"%s/noise%d_scale2.0x_model.bin", model.c_str(), noise);
-    }
-#else
     char parampath[256];
     char modelpath[256];
     if (noise == -1)
@@ -781,14 +583,9 @@ int main(int argc, char** argv)
         sprintf(parampath, "%s/noise%d_scale2.0x_model.param", model.c_str(), noise);
         sprintf(modelpath, "%s/noise%d_scale2.0x_model.bin", model.c_str(), noise);
     }
-#endif
 
     path_t paramfullpath = sanitize_filepath(parampath);
     path_t modelfullpath = sanitize_filepath(modelpath);
-
-#if _WIN32
-    CoInitializeEx(NULL, COINIT_MULTITHREADED);
-#endif
 
     ncnn::create_gpu_instance();
 
@@ -898,12 +695,29 @@ int main(int argc, char** argv)
 
         // main routine
         {
-            // load image
+            // open input video
+            cv::VideoCapture input_video(input_file);
+            if (!input_video.isOpened())
+            {
+                fprintf(stderr, "Failed to open video %s\n", input_file.c_str());
+                return -1;
+            }
+
+            // open output video
+            cv::VideoWriter output_video;
+            int codec = static_cast<int>(input_video.get(cv::CAP_PROP_FOURCC)); // codec
+            int width = (int)input_video.get(cv::CAP_PROP_FRAME_WIDTH);
+            int height = (int)input_video.get(cv::CAP_PROP_FRAME_HEIGHT);
+            cv::Size size(width * scale, height * scale); // size
+            double fps = input_video.get(cv::CAP_PROP_FPS) * fps_multiplier; // fps
+            output_video.open(output_file, codec, fps, size, true);
+            fprintf(stdout, "%d x %d %ffps\n", width * scale, height * scale, fps);
+
             LoadThreadParams ltp;
             ltp.scale = scale;
             ltp.jobs_load = jobs_load;
-            ltp.input_files = input_files;
-            ltp.output_files = output_files;
+            ltp.input_video = input_video;
+            ltp.output_video = output_video;
 
             ncnn::Thread load_thread(load, (void*)&ltp);
 
@@ -936,6 +750,9 @@ int main(int argc, char** argv)
             // save image
             SaveThreadParams stp;
             stp.verbose = verbose;
+            stp.output_video = output_video;
+            stp.output_file = output_file;
+            stp.fps_mult = fps_multiplier;
 
             std::vector<ncnn::Thread*> save_threads(jobs_save);
             for (int i=0; i<jobs_save; i++)
@@ -970,6 +787,10 @@ int main(int argc, char** argv)
                 save_threads[i]->join();
                 delete save_threads[i];
             }
+
+            fprintf(stdout, "DONE?");
+            input_video.release();
+            output_video.release();
         }
 
         for (int i=0; i<use_gpu_count; i++)
